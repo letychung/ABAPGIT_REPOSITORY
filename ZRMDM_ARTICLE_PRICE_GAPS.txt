@@ -1,0 +1,347 @@
+*&---------------------------------------------------------------------*
+*& Report  zrmdm_article_price_gaps
+*&
+*&---------------------------------------------------------------------*
+*----------------------------------------------------------------------*
+*          Confidential and Proprietary                                *
+*          Copyright 2026, KnitWell Group                              *
+*          All Rights Reserved                                         *
+*----------------------------------------------------------------------*
+* Program Name:      ZRMDM_ARTICLE_PRICE_GAPS                          *
+* Created By:        Leticia S. Chee-Chung                             *
+* Created On:        03/06/2026                                        *
+* Version:           ECC 6.0                                           *
+* Purpose:           This program retrieves articles that are missing  *
+*                    current retail, original retail price, and POS    *
+*                    description                                       *
+*                    information                                       *
+* RICEF:             DEV.R.092 - Article Price Gaps Report             *
+* URFM:                                                                *
+*-----------------------------------------------------------------------
+* Modification Log                                                     *
+* Date        Programmer  Transport  SR/Inc#  Description              *
+* 03/05/2026  LCHEE       DE1K924049 423126   Initial Development      *
+************************************************************************
+REPORT zrmdm_article_price_gaps.
+
+TABLES: mara.
+
+*----------------------------------------------------------------------
+* Selection Screen
+*----------------------------------------------------------------------
+SELECTION-SCREEN BEGIN OF BLOCK b1 WITH FRAME TITLE text-t01.
+SELECT-OPTIONS:
+  s_ersda FOR mara-ersda OBLIGATORY,                       " Article creation date
+  s_matnr FOR mara-matnr,                                  " Article number
+  s_matkl FOR mara-matkl NO INTERVALS OBLIGATORY,          " Merchandise category
+  s_satnr FOR mara-matnr,                                  " Generic article number (range / optional)
+  s_attyp FOR mara-attyp DEFAULT '02'.                     " Article category
+SELECTION-SCREEN END OF BLOCK b1.
+
+SELECTION-SCREEN BEGIN OF BLOCK b2 WITH FRAME TITLE text-t02.
+PARAMETERS:
+  p_vkorg TYPE vkorg OBLIGATORY,   " Sales organization
+  p_vtweg TYPE vtweg OBLIGATORY,   " Distribution channel
+  p_bukrs TYPE bukrs OBLIGATORY,   " Company code
+  p_prdat TYPE sy-datum DEFAULT sy-datum. " Pricing date
+SELECTION-SCREEN END OF BLOCK b2.
+
+*----------------------------------------------------------------------
+* Types / data
+*----------------------------------------------------------------------
+TYPES: BEGIN OF ty_output,
+         matnr      TYPE matnr,
+         ersda      TYPE mara-ersda,
+         matkl      TYPE mara-matkl,
+         ean11      TYPE ean11,          " UPC / EAN
+*         color      TYPE zcolor,          " Color description from FM
+         size       TYPE wrf_size1,       " Size (size1_xrf or size1)
+         color_code TYPE wrf_color,       " Color code from FM
+         maktx      TYPE makt-maktx,      " Article description
+         pos_desc   TYPE maktm,          " POS description (GRUND)
+         orig_price TYPE kbetr,           " ZRP0 (original retail)
+         bukrs      TYPE bukrs,           " Company code
+         curr_price TYPE kbetr,           " VKP0 (current retail)
+         vkorg      TYPE vkorg,           " Sales org
+         vtweg      TYPE vtweg,           " Distribution channel
+       END OF ty_output.
+
+TYPES: BEGIN OF ty_mara,
+         matnr TYPE matnr,
+         ersda TYPE ersda,
+         matkl TYPE matkl,
+         ean11 TYPE ean11,
+         color TYPE wrf_color,
+         size1 TYPE wrf_size1,
+         maktx TYPE maktx,
+         maktm TYPE maktm,
+       END OF ty_mara.
+
+
+DATA: t_output  TYPE STANDARD TABLE OF ty_output,
+      wa_output TYPE ty_output.
+
+DATA: t_mara  TYPE HASHED TABLE OF ty_mara
+                WITH UNIQUE KEY matnr,
+      wa_mara LIKE LINE OF t_mara.
+
+DATA: gv_missing_vkp0 TYPE abap_bool,
+      gv_missing_zrp0 TYPE abap_bool,
+      gv_missing_pos  TYPE abap_bool.
+
+DATA: gv_retail_price      TYPE kbetr,
+      gv_retail_orig_price TYPE kbetr,
+      gv_retail_orig_curr  TYPE konwa.
+
+
+*---------------------------------------------------------------------
+* Initialization
+*---------------------------------------------------------------------
+INITIALIZATION.
+  PERFORM select_option_restrictions.
+
+
+*---------------------------------------------------------------------
+* START-OF-SELECTION
+*---------------------------------------------------------------------
+START-OF-SELECTION.
+  PERFORM select_articles.
+  PERFORM evaluate_articles.
+
+  IF t_output[] IS INITIAL.
+    MESSAGE 'No articles found with missing VKP0/ZRP0/POS description'(001)
+      TYPE 'S'.
+    RETURN.
+  ENDIF.
+
+  PERFORM display_result.
+
+*---------------------------------------------------------------------
+* Select candidate articles
+*---------------------------------------------------------------------
+FORM select_articles.
+
+  SELECT mara~matnr,
+         mara~ersda,
+         mara~matkl,
+         mara~ean11,
+         mara~color,
+         mara~size1,
+         makt~maktx,
+         mamt~maktm
+    FROM mara
+    INNER JOIN makt
+    ON mara~matnr = makt~matnr
+    INNER JOIN mamt
+    ON makt~matnr = mamt~matnr
+    INTO TABLE @t_mara
+    WHERE mara~matnr IN @s_matnr
+      AND mara~ersda IN @s_ersda
+      AND mara~matkl IN @s_matkl
+      AND mara~satnr IN @s_satnr
+      AND mara~lvorm = @space
+      AND mara~attyp IN @s_attyp
+      AND makt~spras = @sy-langu
+      AND mamt~spras = @sy-langu
+      AND mamt~meinh = 'EA'
+      AND mamt~mtxid = '02'
+      AND mamt~lfdnr = '01'.
+
+ENDFORM.
+
+*---------------------------------------------------------------------
+* Evaluate each article: pricing, POS description, characteristics
+*---------------------------------------------------------------------
+FORM evaluate_articles.
+
+  LOOP AT t_mara ASSIGNING FIELD-SYMBOL(<fs_mara>).
+
+    CLEAR: gv_retail_price,
+           gv_retail_orig_price,
+           gv_retail_orig_curr,
+           gv_missing_vkp0,
+           gv_missing_zrp0,
+           gv_missing_pos,
+           wa_output.
+
+    " --- Pricing (VKP0 / ZRP0) via Z_MM_ARTICLE_RETAIL_PRICE ---
+    CALL FUNCTION 'Z_MM_ARTICLE_RETAIL_PRICE'
+      EXPORTING
+        matnr                          = <fs_mara>-matnr
+        vkorg                          = p_vkorg
+        vtweg                          = p_vtweg
+        bukrs                          = p_bukrs
+        price_date                     = p_prdat
+      IMPORTING
+        retail_price                   = gv_retail_price
+        retail_orig_price              = gv_retail_orig_price
+        retail_orig_price_curr         = gv_retail_orig_curr
+      EXCEPTIONS
+        material_not_found             = 1
+        no_authority                   = 2
+        no_bukrs_found                 = 3
+        no_sales_price_found           = 4
+        org_structure_not_completed    = 5
+        plant_not_found                = 6
+        vkorg_not_found                = 7
+        calculation_scheme_not_correct = 8
+        pricing_error                  = 9
+        OTHERS                         = 10.
+
+    IF sy-subrc <> 0.
+      CLEAR: gv_retail_price, gv_retail_orig_price.
+    ENDIF.
+
+    gv_missing_vkp0 = xsdbool( gv_retail_price IS INITIAL ).
+    gv_missing_zrp0 = xsdbool( gv_retail_orig_price IS INITIAL ).
+
+    wa_output-pos_desc = <fs_mara>-maktm.
+
+    gv_missing_pos = xsdbool( wa_output-pos_desc IS INITIAL ).
+
+    " --- Only proceed if at least one of the checks failed ---
+    IF gv_missing_vkp0 = abap_true
+    OR gv_missing_zrp0 = abap_true
+    OR gv_missing_pos  = abap_true.
+
+      " Basic fields
+      wa_output-matnr = <fs_mara>-matnr.
+      wa_output-ersda = <fs_mara>-ersda.
+      wa_output-matkl = <fs_mara>-matkl.
+      wa_output-maktx = <fs_mara>-maktx.
+      wa_output-ean11 = <fs_mara>-ean11.
+      wa_output-size = <fs_mara>-size1.
+      wa_output-color_code = <fs_mara>-color.
+
+      " Pricing and org data
+      wa_output-orig_price = gv_retail_orig_price.
+      wa_output-curr_price = gv_retail_price.
+      wa_output-bukrs      = p_bukrs.
+      wa_output-vkorg      = p_vkorg.
+      wa_output-vtweg      = p_vtweg.
+
+      APPEND wa_output TO t_output.
+    ENDIF.
+
+  ENDLOOP.
+
+ENDFORM.
+
+*---------------------------------------------------------------------
+* Display result via SALV
+*---------------------------------------------------------------------
+FORM display_result.
+
+  DATA: lo_alv     TYPE REF TO cl_salv_table,
+        lo_columns TYPE REF TO cl_salv_columns_table,
+        lo_column  TYPE REF TO CL_SALV_COLUMN,
+        lo_display TYPE REF TO cl_salv_display_settings.
+
+  TRY.
+      cl_salv_table=>factory(
+        IMPORTING
+          r_salv_table = lo_alv
+        CHANGING
+          t_table      = t_output ).
+
+      lo_alv->get_functions( )->set_all( abap_true ).
+      lo_alv->get_columns( )->set_optimize( abap_true ).
+      lo_columns = lo_alv->get_columns( ).
+
+      lo_column = lo_columns->get_column( 'EAN11' ).
+      lo_column->set_short_text( 'UPC Number' ).
+      lo_column->set_medium_text( 'UPC Number ' ).
+      lo_column->set_long_text( 'UPC Number ' ).
+
+      lo_column = lo_columns->get_column( 'SIZE' ).
+      lo_column->set_short_text( 'Size' ).
+      lo_column->set_medium_text( 'Size' ).
+      lo_column->set_long_text( 'Size' ).
+
+      lo_column = lo_columns->get_column( 'POS_DESC' ).
+      lo_column->set_short_text( 'POS Desc' ).
+      lo_column->set_medium_text( 'POS Desc' ).
+      lo_column->set_long_text( 'POS Description' ).
+
+      lo_column = lo_columns->get_column( 'ORIG_PRICE' ).
+      lo_column->set_short_text( 'Orig. Ret' ).
+      lo_column->set_medium_text( 'Orig Retail' ).
+      lo_column->set_long_text( 'Original Retail Price' ).
+
+      lo_column = lo_columns->get_column( 'CURR_PRICE' ).
+      lo_column->set_short_text( 'Curr. Ret.' ).
+      lo_column->set_medium_text( 'Curr Retail' ).
+      lo_column->set_long_text( 'Current Ret Price' ).
+*      lo_alv->
+      lo_display = lo_alv->get_display_settings( ).
+      lo_display->set_striped_pattern( abap_true ).
+
+
+      lo_alv->display( ).
+    CATCH  cx_salv_msg INTO DATA(lx_msg).
+      MESSAGE lx_msg->get_text( ) TYPE 'E'.
+  ENDTRY.
+
+ENDFORM.
+*&---------------------------------------------------------------------*
+*&      Form  SELECT_OPTION_RESTRICTIONS
+*&---------------------------------------------------------------------*
+*       text
+*----------------------------------------------------------------------*
+*  -->  p1        text
+*  <--  p2        text
+*----------------------------------------------------------------------*
+FORM select_option_restrictions .
+
+  DATA: selopt   TYPE sscr_ass,
+        opt_list TYPE sscr_opt_list,
+        restrict TYPE sscr_restrict.
+
+* Default date range from current date - 7 to current date
+  s_ersda-low = sy-datum - 7.
+  s_ersda-high = sy-datum.
+  s_ersda-sign = 'I'.
+  s_ersda-option = 'BT'.
+  APPEND s_ersda.
+
+* Disable range options and exclusion
+  CLEAR opt_list.
+  opt_list-name          = 'EQ'.
+  opt_list-options-eq    = 'X'.    "equal
+  opt_list-options-bt    = space.    "between
+  opt_list-options-cp    = 'X'.  "pattern
+  opt_list-options-ge    = space.  "greater equal
+  opt_list-options-gt    = space.  "greater
+  opt_list-options-le    = space.  "less equal
+  opt_list-options-lt    = space.  "less
+  opt_list-options-nb    = space.  "not between
+  opt_list-options-ne    = space.  "not equal
+  APPEND opt_list TO restrict-opt_list_tab.
+
+  CLEAR selopt.
+  selopt-kind            = 'S'.
+  selopt-name            = 'S_MATKL'.
+  selopt-sg_main         = 'I'.
+  selopt-sg_addy         = ' '.
+  selopt-op_main         = 'EQ'.
+  selopt-op_addy         = 'EQ'.
+  APPEND selopt  TO restrict-ass_tab.
+
+  CALL FUNCTION 'SELECT_OPTIONS_RESTRICT'
+    EXPORTING
+      restriction            = restrict
+    EXCEPTIONS
+      too_late               = 1
+      repeated               = 2
+      selopt_without_options = 5
+      selopt_without_signs   = 6
+      invalid_sign           = 7
+      empty_option_list      = 9
+      invalid_kind           = 10
+      repeated_kind_a        = 11
+      OTHERS                 = 12.
+  IF sy-subrc <> 0.
+    MESSAGE i009(za) WITH sy-subrc.
+  ENDIF.
+
+ENDFORM.
